@@ -1,14 +1,44 @@
-import os
 import warnings
-from pathlib import Path
+from io import StringIO
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from textwrap import dedent
+from config import (
+    DB_PATH,
+    MODEL_PATH,
+    REGION_NAME,
+    TARGET_COLUMN,
+    ACTUAL_COLUMN,
+    EIA_FORECAST_COLUMN,
+    TRAINING_TARGET_COLUMN,
+    MAX_ENCODER_LENGTH,
+    MAX_PREDICTION_LENGTH,
+    TRAIN_END_DATE,
+    VALID_END_DATE,
+    TEST_END_DATE,
+    GROUP_IDS,
+    STATIC_CATEGORICALS,
+    BATCH_SIZE,
+    NUM_WORKERS,
+    NO_WEATHER_KNOWN_REALS,
+    EIA_RESPONDENT,
+)
 
+from db_utils import (
+    get_connection,
+    create_tables,
+    read_load_hourly,
+    read_model_predictions,
+    get_table_counts,
+    upsert_model_predictions,
+    upsert_load_hourly,
+)
+
+from eia_client import fetch_eia_region_data
+from preprocessing import preprocess_eia_region_data
 
 warnings.filterwarnings("ignore")
 
@@ -24,150 +54,83 @@ st.set_page_config(
 
 
 # ============================================================
-# App Constants
-# ============================================================
-
-DATA_PATH = "all_features_all_timerange.csv"
-MODEL_PATH = "models/TFT_No_Weather.ckpt"
-
-REGION_NAME = "CAL"
-
-TARGET_COLUMN = "model_target_mw"
-ACTUAL_COLUMN = "region_demand_mw"
-TRAINING_TARGET_COLUMN = "target_region_demand_mw"
-
-MAX_ENCODER_LENGTH = 168
-MAX_PREDICTION_LENGTH = 1
-
-TRAIN_END_DATE = pd.Timestamp("2024-01-01")
-VALID_END_DATE = pd.Timestamp("2025-01-01")
-TEST_END_DATE = pd.Timestamp("2026-05-07")
-
-GROUP_IDS = ["Region"]
-STATIC_CATEGORICALS = ["Region"]
-
-BATCH_SIZE = 128
-NUM_WORKERS = 0
-
-
-# ============================================================
-# Feature Configuration Based on TFT Ablation Notebook
-# ============================================================
-
-BASE_FEATURES = [
-    "time_idx"
-]
-
-CALENDAR_FEATURES = [
-    "hour_sin",
-    "hour_cos",
-    "day_of_week_sin",
-    "day_of_week_cos",
-    "month_sin",
-    "month_cos",
-    "day_of_year_sin",
-    "day_of_year_cos",
-]
-
-HOLIDAY_FEATURES = [
-    "is_weekend",
-    "is_holiday",
-    "is_day_before_holiday",
-    "is_day_after_holiday",
-    "is_holiday_period",
-]
-
-NO_WEATHER_KNOWN_REALS = (
-    BASE_FEATURES
-    + CALENDAR_FEATURES
-    + HOLIDAY_FEATURES
-)
-
-
-# ============================================================
 # Utility Functions
 # ============================================================
 
 def check_required_files():
     missing_items = []
 
-    if not os.path.exists(DATA_PATH):
-        missing_items.append(DATA_PATH)
+    if not DB_PATH.exists():
+        missing_items.append(str(DB_PATH))
 
-    if not os.path.exists(MODEL_PATH):
-        missing_items.append(MODEL_PATH)
+    if not MODEL_PATH.exists():
+        missing_items.append(str(MODEL_PATH))
 
     return missing_items
 
 
-def safe_binary_mapping(series):
-    return series.map({
-        "No": 0,
-        "Yes": 1,
-        "False": 0,
-        "True": 1,
-        "false": 0,
-        "true": 1,
-        0: 0,
-        1: 1,
-        0.0: 0,
-        1.0: 1,
-        False: 0,
-        True: 1,
-    }).fillna(series).astype("int8")
-
-
 @st.cache_data
 def load_and_prepare_data():
-    df = pd.read_csv(DATA_PATH)
+    conn = get_connection()
+    create_tables(conn)
 
-    # Datetime handling
+    df = read_load_hourly(
+        conn=conn,
+        region=REGION_NAME
+    )
+
+    conn.close()
+
+    if df.empty:
+        st.error(
+            "Database is empty. Please run `python seed_database.py` first."
+        )
+        st.stop()
+
     df["timestamp_utc"] = pd.to_datetime(
         df["timestamp_utc"],
         utc=True,
         errors="coerce"
     )
 
-    if "data_date" in df.columns:
-        df["data_date"] = pd.to_datetime(
-            df["data_date"],
-            errors="coerce"
-        )
-    else:
-        df["data_date"] = df["timestamp_utc"].dt.date
-        df["data_date"] = pd.to_datetime(df["data_date"])
-
-    # Avoid mixed timezone problem by deriving local timestamp from UTC
     df["timestamp_local"] = (
         df["timestamp_utc"]
         .dt.tz_convert("America/Los_Angeles")
     )
 
-    if "local_date" in df.columns:
-        df["local_date"] = pd.to_datetime(
-            df["local_date"],
-            errors="coerce"
-        )
-    else:
-        df["local_date"] = df["timestamp_local"].dt.date
-        df["local_date"] = pd.to_datetime(df["local_date"])
+    df["data_date"] = pd.to_datetime(
+        df["data_date"],
+        errors="coerce"
+    )
 
-    # Keep CAL only
+    df["local_date"] = pd.to_datetime(
+        df["local_date"],
+        errors="coerce"
+    )
+
     df = df[df["Region"].astype(str) == REGION_NAME].copy()
-
-    # Sort before time_idx construction
     df = df.sort_values("timestamp_utc").reset_index(drop=True)
 
-    # Continuous hourly time index, matched with TFT notebook
-    df["time_idx"] = (
-        (df["timestamp_utc"] - df["timestamp_utc"].min())
-        .dt.total_seconds() // 3600
-    ).astype(int)
-
-    df["Region"] = df["Region"].astype(str)
-
-    # Binary columns
-    binary_cols = [
+    numeric_cols = [
+        ACTUAL_COLUMN,
+        EIA_FORECAST_COLUMN,
+        TRAINING_TARGET_COLUMN,
+        TARGET_COLUMN,
+        "time_idx",
+        "local_year",
+        "local_month",
+        "local_day",
+        "local_hour",
+        "local_day_of_week",
+        "local_day_of_year",
+        "hour_sin",
+        "hour_cos",
+        "day_of_week_sin",
+        "day_of_week_cos",
+        "month_sin",
+        "month_cos",
+        "day_of_year_sin",
+        "day_of_year_cos",
         "is_weekend",
         "is_holiday",
         "is_day_before_holiday",
@@ -175,26 +138,10 @@ def load_and_prepare_data():
         "is_holiday_period",
     ]
 
-    for col in binary_cols:
+    for col in numeric_cols:
         if col in df.columns:
-            df[col] = safe_binary_mapping(df[col])
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Build TFT target exactly like ablation notebook
-    if TRAINING_TARGET_COLUMN not in df.columns:
-        st.error(f"Missing required column: {TRAINING_TARGET_COLUMN}")
-        st.stop()
-
-    if ACTUAL_COLUMN not in df.columns:
-        st.error(f"Missing required column: {ACTUAL_COLUMN}")
-        st.stop()
-
-    df[TARGET_COLUMN] = np.where(
-        df["data_date"] < TRAIN_END_DATE,
-        df[TRAINING_TARGET_COLUMN],
-        df[ACTUAL_COLUMN]
-    )
-
-    # Drop rows without model target
     df = df.dropna(subset=[TARGET_COLUMN]).copy()
 
     return df
@@ -239,6 +186,7 @@ def evaluate_prediction(y_true, y_pred):
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
 
     nonzero_mask = y_true != 0
+
     if nonzero_mask.sum() > 0:
         mape = (
             np.mean(
@@ -267,6 +215,273 @@ def evaluate_prediction(y_true, y_pred):
         "R2": r2,
     }
 
+def build_prediction_records(
+    result_df,
+    model_name="TFT_No_Weather",
+    horizon_hours=1,
+    source="streamlit_app",
+):
+    """
+    Convert TFT prediction result dataframe into records
+    compatible with the model_predictions database table.
+    """
+    if result_df is None or result_df.empty:
+        return pd.DataFrame()
+
+    prediction_df = result_df.copy()
+
+    required_cols = [
+        "timestamp_utc",
+        "timestamp_local",
+        "Region",
+        "tft_prediction_mw",
+        "actual_mw",
+    ]
+
+    missing_cols = [
+        col for col in required_cols
+        if col not in prediction_df.columns
+    ]
+
+    if missing_cols:
+        raise ValueError(
+            "Missing required columns for prediction records: "
+            + ", ".join(missing_cols)
+        )
+
+    prediction_records = pd.DataFrame({
+        "timestamp_utc": pd.to_datetime(
+            prediction_df["timestamp_utc"],
+            utc=True,
+            errors="coerce"
+        ).astype(str),
+
+        "timestamp_local": pd.to_datetime(
+            prediction_df["timestamp_local"],
+            errors="coerce"
+        ).astype(str),
+
+        "Region": prediction_df["Region"].astype(str),
+
+        "model_name": model_name,
+        "horizon_hours": horizon_hours,
+
+        "prediction_mw": pd.to_numeric(
+            prediction_df["tft_prediction_mw"],
+            errors="coerce"
+        ),
+
+        "actual_mw": pd.to_numeric(
+            prediction_df["actual_mw"],
+            errors="coerce"
+        ),
+    })
+
+    prediction_records["absolute_error_mw"] = (
+        prediction_records["actual_mw"]
+        - prediction_records["prediction_mw"]
+    ).abs()
+
+    prediction_records["ape"] = np.where(
+        prediction_records["actual_mw"] != 0,
+        prediction_records["absolute_error_mw"]
+        / prediction_records["actual_mw"]
+        * 100,
+        np.nan
+    )
+
+    prediction_records["prediction_created_at"] = (
+        pd.Timestamp.utcnow().isoformat()
+    )
+
+    prediction_records["source"] = source
+
+    prediction_records = prediction_records.where(
+        pd.notnull(prediction_records),
+        None
+    )
+
+    return prediction_records
+
+def save_prediction_records_to_db(prediction_records):
+    """
+    Save prediction records to the model_predictions table.
+    """
+    if prediction_records is None or prediction_records.empty:
+        return 0
+
+    conn = get_connection()
+    create_tables(conn)
+
+    saved_rows = upsert_model_predictions(
+        conn=conn,
+        df=prediction_records
+    )
+
+    conn.close()
+
+    # Clear Streamlit cache so database status can refresh
+    load_and_prepare_data.clear()
+
+    return saved_rows
+
+def load_predictions_from_db():
+    conn = get_connection()
+    create_tables(conn)
+
+    predictions_df = read_model_predictions(
+        conn=conn,
+        region=REGION_NAME,
+        model_name="TFT_No_Weather"
+    )
+
+    conn.close()
+
+    if predictions_df.empty:
+        return predictions_df
+
+    predictions_df["timestamp_utc"] = pd.to_datetime(
+        predictions_df["timestamp_utc"],
+        utc=True,
+        errors="coerce"
+    )
+
+    predictions_df["timestamp_local"] = (
+        predictions_df["timestamp_utc"]
+        .dt.tz_convert("America/Los_Angeles")
+    )
+
+    numeric_cols = [
+        "prediction_mw",
+        "actual_mw",
+        "absolute_error_mw",
+        "ape",
+        "horizon_hours",
+    ]
+
+    for col in numeric_cols:
+        if col in predictions_df.columns:
+            predictions_df[col] = pd.to_numeric(
+                predictions_df[col],
+                errors="coerce"
+            )
+
+    return predictions_df
+
+def build_monitoring_dataframe(load_df, predictions_df):
+    if predictions_df.empty:
+        monitoring_df = load_df.copy()
+        monitoring_df["tft_prediction_mw"] = np.nan
+        monitoring_df["tft_absolute_error_mw"] = np.nan
+        monitoring_df["tft_ape"] = np.nan
+        return monitoring_df
+
+    pred_cols = [
+        "timestamp_utc",
+        "Region",
+        "prediction_mw",
+        "absolute_error_mw",
+        "ape",
+    ]
+
+    pred_df = predictions_df[pred_cols].copy()
+
+    pred_df = pred_df.rename(columns={
+        "prediction_mw": "tft_prediction_mw",
+        "absolute_error_mw": "tft_absolute_error_mw",
+        "ape": "tft_ape",
+    })
+
+    monitoring_df = load_df.merge(
+        pred_df,
+        on=["timestamp_utc", "Region"],
+        how="left"
+    )
+
+    return monitoring_df
+
+def calculate_monitoring_metrics(monitoring_df):
+    eval_df = monitoring_df.dropna(
+        subset=[ACTUAL_COLUMN, "tft_prediction_mw"]
+    ).copy()
+
+    if eval_df.empty:
+        return None
+
+    return evaluate_prediction(
+        eval_df[ACTUAL_COLUMN],
+        eval_df["tft_prediction_mw"]
+    )
+
+def get_app_eia_api_key():
+    """
+    Read EIA API key from Streamlit secrets or environment variable.
+    """
+    import os
+
+    try:
+        if "EIA_API_KEY" in st.secrets:
+            return st.secrets["EIA_API_KEY"]
+    except Exception:
+        pass
+
+    return os.getenv("EIA_API_KEY")
+
+def fetch_and_store_latest_eia_data(load_df, lookback_days=7):
+    """
+    Fetch latest EIA data, preprocess it, and upsert it into load_hourly.
+    """
+    api_key = get_app_eia_api_key()
+
+    if not api_key:
+        raise ValueError(
+            "EIA_API_KEY is missing. Set it as an environment variable or Streamlit secret."
+        )
+
+    historical_start = load_df["timestamp_utc"].min()
+
+    latest_timestamp = load_df["timestamp_utc"].max()
+
+    api_start_timestamp = latest_timestamp - pd.Timedelta(days=lookback_days)
+
+    api_start = api_start_timestamp.strftime("%Y-%m-%dT%H")
+
+    raw_api_df = fetch_eia_region_data(
+        api_key=api_key,
+        respondent=EIA_RESPONDENT,
+        start=api_start,
+        length=5000,
+    )
+
+    processed_api_df = preprocess_eia_region_data(
+        raw_df=raw_api_df,
+        historical_start_timestamp=historical_start,
+    )
+
+    if processed_api_df.empty:
+        return {
+            "raw_rows": len(raw_api_df),
+            "processed_rows": 0,
+            "saved_rows": 0,
+        }
+
+    conn = get_connection()
+    create_tables(conn)
+
+    saved_rows = upsert_load_hourly(
+        conn=conn,
+        df=processed_api_df
+    )
+
+    conn.close()
+
+    load_and_prepare_data.clear()
+
+    return {
+        "raw_rows": len(raw_api_df),
+        "processed_rows": len(processed_api_df),
+        "saved_rows": saved_rows,
+    }
 
 def extract_actuals_from_dataloader(dataloader):
     import torch
@@ -280,23 +495,43 @@ def extract_actuals_from_dataloader(dataloader):
 
     return torch.cat(actuals, dim=0)
 
+def get_latest_prediction_range(load_df, max_rows=24):
+    """
+    Select the latest rows that have enough historical encoder context
+    for TFT prediction.
+    """
+    df_sorted = load_df.sort_values("time_idx").copy()
+
+    min_allowed_time_idx = df_sorted["time_idx"].min() + MAX_ENCODER_LENGTH
+
+    eligible_df = df_sorted[
+        df_sorted["time_idx"] >= min_allowed_time_idx
+    ].copy()
+
+    if eligible_df.empty:
+        return None, None
+
+    selected_df = eligible_df.tail(max_rows).copy()
+
+    start_time_idx = int(selected_df["time_idx"].min())
+    end_time_idx = int(selected_df["time_idx"].max())
+
+    return start_time_idx, end_time_idx
 
 # ============================================================
 # TFT Functions
 # ============================================================
 
 @st.cache_resource
-def load_tft_dependencies_and_model(model_path):
+def load_tft_dependencies_and_model(model_path_str):
     try:
-        import torch
         from pytorch_forecasting import TimeSeriesDataSet, TemporalFusionTransformer
         from pytorch_forecasting.data import GroupNormalizer
 
-        model = TemporalFusionTransformer.load_from_checkpoint(model_path)
+        model = TemporalFusionTransformer.load_from_checkpoint(model_path_str)
         model.eval()
 
         return {
-            "torch": torch,
             "TimeSeriesDataSet": TimeSeriesDataSet,
             "TemporalFusionTransformer": TemporalFusionTransformer,
             "GroupNormalizer": GroupNormalizer,
@@ -318,17 +553,13 @@ def load_tft_dependencies_and_model(model_path):
 
 
 @st.cache_resource
-def build_training_dataset(df_serialized, known_reals):
-    """
-    Streamlit cache_resource cannot directly cache mutable dataframe reliably,
-    so this function receives a serialized dataframe.
-    """
-    from io import StringIO
-
-    deps = load_tft_dependencies_and_model(MODEL_PATH)
+def build_training_dataset(df_serialized, known_reals_tuple):
+    deps = load_tft_dependencies_and_model(str(MODEL_PATH))
 
     TimeSeriesDataSet = deps["TimeSeriesDataSet"]
     GroupNormalizer = deps["GroupNormalizer"]
+
+    known_reals = list(known_reals_tuple)
 
     df = pd.read_json(StringIO(df_serialized), orient="split")
 
@@ -370,7 +601,7 @@ def build_training_dataset(df_serialized, known_reals):
 
 
 def predict_tft_for_range(df, training_dataset, start_time_idx, end_time_idx):
-    deps = load_tft_dependencies_and_model(MODEL_PATH)
+    deps = load_tft_dependencies_and_model(str(MODEL_PATH))
     model = deps["model"]
 
     prediction_df = df[
@@ -435,10 +666,10 @@ st.write(
 
 missing_items = check_required_files()
 
-if DATA_PATH in missing_items:
+if str(DB_PATH) in missing_items:
     st.error(
-        f"Dataset file not found: `{DATA_PATH}`. "
-        "Please place the CSV file in the same folder as app.py."
+        f"Database file not found: `{DB_PATH}`. "
+        "Please run `python seed_database.py` first."
     )
     st.stop()
 
@@ -451,6 +682,39 @@ missing_feature_cols = [
     if col not in df.columns
 ]
 
+with st.expander("Database Status", expanded=False):
+    conn = get_connection()
+    create_tables(conn)
+
+    counts = get_table_counts(conn)
+    predictions_df_preview = read_model_predictions(
+        conn=conn,
+        region=REGION_NAME
+    )
+
+    conn.close()
+
+    st.write("**Database path:**")
+    st.code(str(DB_PATH))
+
+    st.write("**Table row counts:**")
+    st.json(counts)
+
+    st.write("**Prediction rows loaded:**", len(predictions_df_preview))
+
+    if not predictions_df_preview.empty:
+        st.write("**Prediction models in database:**")
+        st.dataframe(
+            predictions_df_preview["model_name"]
+            .value_counts()
+            .reset_index()
+            .rename(columns={
+                "model_name": "model_name",
+                "count": "row_count"
+            }),
+            use_container_width=True
+        )
+
 with st.expander("Model Configuration", expanded=False):
     st.write("**Region:**", REGION_NAME)
     st.write("**Target column:**", TARGET_COLUMN)
@@ -461,7 +725,7 @@ with st.expander("Model Configuration", expanded=False):
 
     if missing_feature_cols:
         st.warning(
-            "Some expected no-weather features are missing from the CSV. "
+            "Some expected no-weather features are missing from the database. "
             "The app will use only the available features."
         )
         st.code("\n".join(missing_feature_cols))
@@ -476,8 +740,9 @@ st.sidebar.header("Dashboard Settings")
 mode = st.sidebar.radio(
     "Prediction Mode",
     [
+        "Live Monitoring",
         "Single Historical Prediction",
-        "Recent Test Backtest"
+        "Recent Test Backtest",
     ]
 )
 
@@ -485,9 +750,9 @@ st.sidebar.markdown("---")
 
 st.sidebar.write("Model setup: **TFT No-Weather**")
 st.sidebar.write("Region: **CAL**")
+st.sidebar.write("Data source: **SQLite Database**")
 
-model_available = os.path.exists(MODEL_PATH)
-
+model_available = MODEL_PATH.exists()
 
 if model_available:
     st.sidebar.success("TFT checkpoint found")
@@ -520,7 +785,306 @@ st.metric(
 # Single Historical Prediction Mode
 # ============================================================
 
-if mode == "Single Historical Prediction":
+# ============================================================
+# Live Monitoring Mode
+# ============================================================
+
+if mode == "Live Monitoring":
+    latest_prediction_rows = st.sidebar.selectbox(
+        "TFT Prediction Update Rows",
+        [24, 48, 72, 168],
+        index=0
+    )
+        
+    st.subheader("Live Monitoring")
+
+    st.write(
+        "This page monitors CAL electricity load using the database as the main data source. "
+        "It combines actual demand data with TFT No-Weather predictions that have already "
+        "been saved into the database."
+    )
+
+    st.markdown("### EIA API Update")
+
+    update_col1, update_col2 = st.columns([1, 2])
+
+    with update_col1:
+        fetch_button = st.button(
+            "Fetch Latest EIA Data",
+            use_container_width=True
+        )
+
+    with update_col2:
+        st.caption(
+            "This button manually retrieves the latest CAL actual demand and "
+            "EIA demand forecast from the EIA API, then stores the processed data "
+            "into the SQLite database."
+        )
+
+    if fetch_button:
+        with st.spinner("Fetching latest EIA data and updating database..."):
+            try:
+                update_result = fetch_and_store_latest_eia_data(
+                    load_df=df,
+                    lookback_days=7
+                )
+
+                st.success(
+                    "EIA data update completed. "
+                    f"Raw rows: {update_result['raw_rows']:,}, "
+                    f"processed rows: {update_result['processed_rows']:,}, "
+                    f"saved rows: {update_result['saved_rows']:,}."
+                )
+
+                st.rerun()
+
+            except Exception as e:
+                st.error("Failed to fetch or store EIA data.")
+                st.exception(e)
+
+    st.markdown("### TFT Prediction Update")
+
+    prediction_col1, prediction_col2 = st.columns([1, 2])
+
+    with prediction_col1:
+        run_latest_prediction_button = st.button(
+            "Run TFT Prediction for Latest Data",
+            use_container_width=True
+        )
+    
+    if run_latest_prediction_button:
+        if not model_available:
+            st.error(
+                f"TFT checkpoint not found at `{MODEL_PATH}`. "
+                "Cannot run latest TFT prediction."
+            )
+        else:
+            start_time_idx, end_time_idx = get_latest_prediction_range(
+                load_df=df,
+                max_rows=latest_prediction_rows
+            )
+
+            if start_time_idx is None:
+                st.warning(
+                    "No eligible rows found for TFT prediction. "
+                    f"At least {MAX_ENCODER_LENGTH} hours of history are required."
+                )
+            else:
+                with st.spinner("Running TFT prediction for latest database rows..."):
+                    df_serialized = df.to_json(orient="split", date_format="iso")
+
+                    training_dataset = build_training_dataset(
+                        df_serialized,
+                        tuple(known_reals)
+                    )
+
+                    latest_result_df = predict_tft_for_range(
+                        df=df,
+                        training_dataset=training_dataset,
+                        start_time_idx=start_time_idx,
+                        end_time_idx=end_time_idx
+                    )
+
+                    prediction_records = build_prediction_records(
+                        result_df=latest_result_df,
+                        model_name="TFT_No_Weather",
+                        horizon_hours=1,
+                        source="live_monitoring_latest_prediction"
+                    )
+
+                    saved_rows = save_prediction_records_to_db(prediction_records)
+
+                st.success(
+                    f"Saved {saved_rows:,} latest TFT prediction record(s) to the database."
+                )
+
+                st.rerun()
+
+    with prediction_col2:
+        st.caption(
+            "This button runs the TFT No-Weather model for the latest available rows "
+            "in the database and stores the predictions into the model_predictions table."
+        )
+
+    predictions_df = load_predictions_from_db()
+
+    monitoring_df = build_monitoring_dataframe(
+        load_df=df,
+        predictions_df=predictions_df
+    )
+
+    latest_row = monitoring_df.sort_values("timestamp_utc").iloc[-1]
+
+    latest_actual = latest_row[ACTUAL_COLUMN]
+
+    latest_eia_forecast = (
+        latest_row[EIA_FORECAST_COLUMN]
+        if EIA_FORECAST_COLUMN in monitoring_df.columns
+        else np.nan
+    )
+
+    latest_prediction_df = predictions_df.dropna(
+        subset=["prediction_mw"]
+    ).sort_values("timestamp_utc") if not predictions_df.empty else pd.DataFrame()
+
+    if not latest_prediction_df.empty:
+        latest_prediction_row = latest_prediction_df.iloc[-1]
+        latest_tft_prediction = latest_prediction_row["prediction_mw"]
+        latest_prediction_time = latest_prediction_row["timestamp_local"]
+    else:
+        latest_tft_prediction = np.nan
+        latest_prediction_time = None
+
+    st.markdown("### Latest Status")
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric(
+        "Latest Actual Load",
+        f"{latest_actual:,.2f} MW"
+        if pd.notnull(latest_actual)
+        else "N/A"
+    )
+
+    col2.metric(
+        "Latest EIA Forecast",
+        f"{latest_eia_forecast:,.2f} MW"
+        if pd.notnull(latest_eia_forecast)
+        else "N/A"
+    )
+
+    col3.metric(
+        "Latest TFT Prediction",
+        f"{latest_tft_prediction:,.2f} MW"
+        if pd.notnull(latest_tft_prediction)
+        else "N/A"
+    )
+
+    col4.metric(
+        "Last Data Timestamp",
+        str(latest_row["timestamp_local"])
+    )
+
+    if latest_prediction_time is not None:
+        st.caption(
+            f"Latest saved TFT prediction timestamp: {latest_prediction_time}"
+        )
+    else:
+        st.info(
+            "No TFT prediction has been saved yet. "
+            "Run Single Historical Prediction or Recent Test Backtest first."
+        )
+
+    st.markdown("### Evaluation Metrics from Saved TFT Predictions")
+
+    metrics = calculate_monitoring_metrics(monitoring_df)
+
+    if metrics is None:
+        st.warning(
+            "No saved TFT predictions with matching actual values are available yet."
+        )
+    else:
+        m1, m2, m3, m4 = st.columns(4)
+
+        m1.metric("MAE", f"{metrics['MAE']:,.2f} MW")
+        m2.metric("RMSE", f"{metrics['RMSE']:,.2f} MW")
+        m3.metric("MAPE", f"{metrics['MAPE']:.2f}%")
+        m4.metric("R²", f"{metrics['R2']:.4f}")
+
+    st.markdown("### Main Monitoring Chart")
+
+    window_options = {
+        "Last 24 hours": 24,
+        "Last 3 days": 72,
+        "Last 7 days": 168,
+        "Last 14 days": 336,
+        "Last 30 days": 720,
+    }
+
+    selected_window_label = st.sidebar.selectbox(
+        "Monitoring Window",
+        list(window_options.keys()),
+        index=2
+    )
+
+    selected_window = window_options[selected_window_label]
+
+    chart_df = monitoring_df.sort_values("timestamp_utc").tail(selected_window).copy()
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+
+    ax.plot(
+        chart_df["timestamp_local"],
+        chart_df[ACTUAL_COLUMN],
+        label="Actual Load"
+    )
+
+    if EIA_FORECAST_COLUMN in chart_df.columns:
+        eia_chart_df = chart_df.dropna(subset=[EIA_FORECAST_COLUMN])
+
+        if not eia_chart_df.empty:
+            ax.plot(
+                eia_chart_df["timestamp_local"],
+                eia_chart_df[EIA_FORECAST_COLUMN],
+                linestyle="--",
+                label="EIA Forecast"
+            )
+
+    tft_chart_df = chart_df.dropna(subset=["tft_prediction_mw"]).copy()
+
+    if not tft_chart_df.empty:
+        ax.plot(
+            tft_chart_df["timestamp_local"],
+            tft_chart_df["tft_prediction_mw"],
+            linestyle="-",
+            label="TFT Prediction"
+        )
+    else:
+        st.warning(
+            "No saved TFT predictions are available within the selected monitoring window. "
+            "Try selecting a longer monitoring window or run TFT prediction for the latest data."
+        )
+
+    ax.set_title("CAL Actual Load, EIA Forecast, and Saved TFT Predictions")
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Load (MW)")
+    ax.legend()
+
+    st.pyplot(fig)
+
+    st.markdown("### Saved Prediction Records")
+
+    if predictions_df.empty:
+        st.info("No prediction records are currently stored in the database.")
+    else:
+        display_prediction_df = predictions_df.sort_values(
+            "timestamp_utc",
+            ascending=False
+        ).copy()
+
+        display_cols = [
+            "timestamp_local",
+            "model_name",
+            "horizon_hours",
+            "prediction_mw",
+            "actual_mw",
+            "absolute_error_mw",
+            "ape",
+            "source",
+            "prediction_created_at",
+        ]
+
+        display_cols = [
+            col for col in display_cols
+            if col in display_prediction_df.columns
+        ]
+
+        st.dataframe(
+            display_prediction_df[display_cols].head(100),
+            use_container_width=True
+        )
+
+elif mode == "Single Historical Prediction":
     st.subheader("Single Historical Prediction")
 
     st.write(
@@ -574,8 +1138,6 @@ if mode == "Single Historical Prediction":
 
     selected_hour = time_options[selected_time_label]
 
-    selected_timestamp_naive = pd.Timestamp(selected_date) + pd.Timedelta(hours=selected_hour)
-
     candidate_rows = df[
         (df["timestamp_local"].dt.date == selected_date)
         & (df["timestamp_local"].dt.hour == selected_hour)
@@ -583,7 +1145,7 @@ if mode == "Single Historical Prediction":
 
     if candidate_rows.empty:
         st.warning(
-            "Selected timestamp is not available in the dataset. "
+            "Selected timestamp is not available in the database. "
             "Please choose another date or hour."
         )
     else:
@@ -597,6 +1159,7 @@ if mode == "Single Historical Prediction":
             )
         else:
             actual_value = float(selected_row[ACTUAL_COLUMN])
+
             baseline_prediction = historical_average_baseline(
                 df,
                 selected_row["timestamp_local"]
@@ -619,9 +1182,10 @@ if mode == "Single Historical Prediction":
                 if st.button("Run TFT Prediction", use_container_width=True):
                     with st.spinner("Running TFT No-Weather prediction..."):
                         df_serialized = df.to_json(orient="split", date_format="iso")
+
                         training_dataset = build_training_dataset(
                             df_serialized,
-                            known_reals
+                            tuple(known_reals)
                         )
 
                         tft_result = predict_tft_for_range(
@@ -664,6 +1228,19 @@ if mode == "Single Historical Prediction":
 
                         st.dataframe(comparison_df, use_container_width=True)
 
+                        prediction_records = build_prediction_records(
+                            result_df=tft_result,
+                            model_name="TFT_No_Weather",
+                            horizon_hours=1,
+                            source="single_historical_prediction"
+                        )
+
+                        saved_rows = save_prediction_records_to_db(prediction_records)
+
+                        st.success(
+                            f"Saved {saved_rows:,} TFT prediction record(s) to the database."
+                        )
+
                     else:
                         st.error("TFT prediction returned no result.")
 
@@ -691,8 +1268,10 @@ if mode == "Single Historical Prediction":
                 if col in df.columns
             ]
 
+            selected_feature_df = selected_row[feature_cols_to_show].to_frame().T
+
             st.dataframe(
-                selected_row[feature_cols_to_show].to_frame().T,
+                selected_feature_df,
                 use_container_width=True
             )
 
@@ -705,48 +1284,37 @@ if mode == "Single Historical Prediction":
 
             fig, ax = plt.subplots(figsize=(12, 4))
 
-            # Actual load line
             ax.plot(
                 context_df["timestamp_local"],
-                context_df[ACTUAL_COLUMN],
-                label="Actual Load"
+                context_df[ACTUAL_COLUMN]
             )
 
-            # Selected timestamp vertical line
             ax.axvline(
                 selected_row["timestamp_local"],
-                linestyle="--",
-                label="Selected Timestamp"
+                linestyle="--"
             )
 
-            # Historical baseline horizontal line
             ax.axhline(
                 baseline_prediction,
-                linestyle=":",
-                label="Historical Average Baseline"
+                linestyle=":"
             )
 
-            # Actual point at selected timestamp
             ax.scatter(
                 selected_row["timestamp_local"],
                 actual_value,
                 s=80,
-                label="Actual at Selected Timestamp",
                 zorder=5
             )
 
-            # TFT prediction point, only if available
             if tft_pred_value is not None:
                 ax.scatter(
                     selected_row["timestamp_local"],
                     tft_pred_value,
                     s=100,
                     marker="X",
-                    label="TFT Prediction",
                     zorder=6
                 )
 
-                # Optional: connect actual and TFT prediction with a vertical segment
                 ax.plot(
                     [selected_row["timestamp_local"], selected_row["timestamp_local"]],
                     [actual_value, tft_pred_value],
@@ -754,7 +1322,6 @@ if mode == "Single Historical Prediction":
                     alpha=0.7
                 )
 
-                # Optional: annotate TFT prediction value
                 ax.annotate(
                     f"TFT: {tft_pred_value:,.0f} MW",
                     xy=(selected_row["timestamp_local"], tft_pred_value),
@@ -762,7 +1329,6 @@ if mode == "Single Historical Prediction":
                     textcoords="offset points"
                 )
 
-            # Optional: annotate actual value
             ax.annotate(
                 f"Actual: {actual_value:,.0f} MW",
                 xy=(selected_row["timestamp_local"], actual_value),
@@ -773,7 +1339,6 @@ if mode == "Single Historical Prediction":
             ax.set_title("Actual Load Around Selected Timestamp")
             ax.set_xlabel("Time")
             ax.set_ylabel("Load (MW)")
-            # ax.legend()
 
             st.pyplot(fig)
 
@@ -782,15 +1347,15 @@ if mode == "Single Historical Prediction":
             legend_col1, legend_col2, legend_col3 = st.columns(3)
 
             with legend_col1:
-                st.markdown("**🔵 Actual Load**  \nHistorical actual electricity load.")
+                st.markdown("**━ Actual Load**  \nHistorical actual electricity load.")
                 st.markdown("**╏ Selected Timestamp**  \nDashed vertical line showing selected date and hour.")
 
             with legend_col2:
-                st.markdown("**⋯ Historical Average Baseline**  \nDotted horizontal line showing average load for selected month and hour.")
-                st.markdown("**🔵 Actual Point**  \nFilled circle showing actual load at selected timestamp.")
+                st.markdown("**⋯ Historical Average Baseline**  \nAverage load for the selected month and hour.")
+                st.markdown("**🔵 Actual Point**  \nActual load at selected timestamp.")
 
             with legend_col3:
-                st.markdown("**❌ TFT Prediction**  \nX marker showing TFT No-Weather model output.")
+                st.markdown("**❌ TFT Prediction**  \nTFT No-Weather model output.")
 
 
 # ============================================================
@@ -837,7 +1402,7 @@ elif mode == "Recent Test Backtest":
         ].copy()
 
         if test_df.empty:
-            st.error("No test-period rows found in the dataset.")
+            st.error("No test-period rows found in the database.")
         else:
             max_rows = st.sidebar.slider(
                 "Backtest rows",
@@ -855,9 +1420,10 @@ elif mode == "Recent Test Backtest":
             if st.button("Run Recent TFT Backtest", use_container_width=True):
                 with st.spinner("Running recent TFT backtest..."):
                     df_serialized = df.to_json(orient="split", date_format="iso")
+
                     training_dataset = build_training_dataset(
                         df_serialized,
-                        known_reals
+                        tuple(known_reals)
                     )
 
                     result_df = predict_tft_for_range(
@@ -867,12 +1433,25 @@ elif mode == "Recent Test Backtest":
                         end_time_idx=end_time_idx
                     )
 
+                    prediction_records = build_prediction_records(
+                        result_df=result_df,
+                        model_name="TFT_No_Weather",
+                        horizon_hours=1,
+                        source="recent_test_backtest"
+                    )
+
+                    saved_rows = save_prediction_records_to_db(prediction_records)
+
                 metrics = evaluate_prediction(
                     result_df["actual_mw"],
                     result_df["tft_prediction_mw"]
                 )
 
                 st.subheader("TFT No-Weather Backtest Metrics")
+
+                st.success(
+                    f"Saved {saved_rows:,} TFT backtest prediction record(s) to the database."
+                )
 
                 if metrics is not None:
                     c1, c2, c3, c4 = st.columns(4)
@@ -936,7 +1515,7 @@ elif mode == "Recent Test Backtest":
 st.markdown("---")
 
 st.caption(
-    "Dashboard version: TFT No-Weather integration. "
-    "The model setup follows the ablation study configuration: "
+    "Dashboard version: SQLite database integration. "
+    "The model setup follows the TFT No-Weather configuration: "
     "time_idx + calendar features + holiday features, without weather variables."
 )

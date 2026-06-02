@@ -8,3 +8,4 @@ joblib
 torch
 lightning
 pytorch-forecasting
+requests
