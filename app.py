@@ -495,12 +495,23 @@ def extract_actuals_from_dataloader(dataloader):
 
     return torch.cat(actuals, dim=0)
 
-def get_latest_prediction_range(load_df, max_rows=24):
+def get_latest_unpredicted_prediction_range(
+    load_df,
+    predictions_df,
+    max_rows=24,
+    model_name="TFT_No_Weather",
+):
     """
-    Select the latest rows that have enough historical encoder context
-    for TFT prediction.
+    Select the latest rows that have enough encoder context and do not yet
+    have saved TFT predictions in the model_predictions table.
+
+    Returns:
+        start_time_idx, end_time_idx, selected_df
     """
     df_sorted = load_df.sort_values("time_idx").copy()
+
+    if df_sorted.empty:
+        return None, None, pd.DataFrame()
 
     min_allowed_time_idx = df_sorted["time_idx"].min() + MAX_ENCODER_LENGTH
 
@@ -509,14 +520,97 @@ def get_latest_prediction_range(load_df, max_rows=24):
     ].copy()
 
     if eligible_df.empty:
-        return None, None
+        return None, None, pd.DataFrame()
 
-    selected_df = eligible_df.tail(max_rows).copy()
+    eligible_df["timestamp_utc"] = pd.to_datetime(
+        eligible_df["timestamp_utc"],
+        utc=True,
+        errors="coerce"
+    )
+
+    # Only compare against saved predictions from the same model and horizon.
+    if predictions_df is not None and not predictions_df.empty:
+        pred_df = predictions_df.copy()
+
+        if "model_name" in pred_df.columns:
+            pred_df = pred_df[pred_df["model_name"] == model_name].copy()
+
+        if "horizon_hours" in pred_df.columns:
+            pred_df = pred_df[pd.to_numeric(pred_df["horizon_hours"], errors="coerce") == 1].copy()
+
+        pred_df["timestamp_utc"] = pd.to_datetime(
+            pred_df["timestamp_utc"],
+            utc=True,
+            errors="coerce"
+        )
+
+        predicted_timestamps = set(pred_df["timestamp_utc"].dropna())
+    else:
+        predicted_timestamps = set()
+
+    unpredicted_df = eligible_df[
+        ~eligible_df["timestamp_utc"].isin(predicted_timestamps)
+    ].copy()
+
+    if unpredicted_df.empty:
+        return None, None, pd.DataFrame()
+
+    selected_df = unpredicted_df.tail(max_rows).copy()
 
     start_time_idx = int(selected_df["time_idx"].min())
     end_time_idx = int(selected_df["time_idx"].max())
 
-    return start_time_idx, end_time_idx
+    return start_time_idx, end_time_idx, selected_df
+
+
+def plot_tft_prediction_segments(
+    ax,
+    tft_chart_df,
+    time_col="timestamp_local",
+    prediction_col="tft_prediction_mw",
+    max_gap_hours=1.5,
+):
+    """
+    Plot TFT predictions as line segments without connecting points across
+    large time gaps. This prevents misleading diagonal lines when predictions
+    are sparse.
+    """
+    if tft_chart_df is None or tft_chart_df.empty:
+        return
+
+    plot_df = tft_chart_df.sort_values(time_col).copy()
+    plot_df[time_col] = pd.to_datetime(plot_df[time_col], errors="coerce")
+    plot_df = plot_df.dropna(subset=[time_col, prediction_col]).copy()
+
+    if plot_df.empty:
+        return
+
+    time_diff_hours = plot_df[time_col].diff().dt.total_seconds().div(3600)
+    plot_df["segment_id"] = (time_diff_hours > max_gap_hours).cumsum()
+
+    first_segment = True
+
+    for _, segment_df in plot_df.groupby("segment_id"):
+        label = "TFT Prediction" if first_segment else None
+
+        if len(segment_df) == 1:
+            ax.scatter(
+                segment_df[time_col],
+                segment_df[prediction_col],
+                marker="x",
+                s=60,
+                label=label,
+                zorder=5
+            )
+        else:
+            ax.plot(
+                segment_df[time_col],
+                segment_df[prediction_col],
+                linestyle="-",
+                label=label
+            )
+
+        first_segment = False
 
 # ============================================================
 # TFT Functions
@@ -859,18 +953,32 @@ if mode == "Live Monitoring":
                 "Cannot run latest TFT prediction."
             )
         else:
-            start_time_idx, end_time_idx = get_latest_prediction_range(
-                load_df=df,
-                max_rows=latest_prediction_rows
+            current_predictions_df = load_predictions_from_db()
+
+            start_time_idx, end_time_idx, selected_prediction_rows_df = (
+                get_latest_unpredicted_prediction_range(
+                    load_df=df,
+                    predictions_df=current_predictions_df,
+                    max_rows=latest_prediction_rows,
+                    model_name="TFT_No_Weather",
+                )
             )
 
             if start_time_idx is None:
-                st.warning(
-                    "No eligible rows found for TFT prediction. "
-                    f"At least {MAX_ENCODER_LENGTH} hours of history are required."
+                st.info(
+                    "The latest eligible rows already have saved TFT predictions. "
+                    "Fetch newer EIA data first or increase the monitoring window if needed."
                 )
             else:
-                with st.spinner("Running TFT prediction for latest database rows..."):
+                selected_start = selected_prediction_rows_df["timestamp_local"].min()
+                selected_end = selected_prediction_rows_df["timestamp_local"].max()
+
+                st.info(
+                    "Running TFT prediction for unpredicted latest rows from "
+                    f"{selected_start} to {selected_end}."
+                )
+
+                with st.spinner("Running TFT prediction for latest unpredicted database rows..."):
                     df_serialized = df.to_json(orient="split", date_format="iso")
 
                     training_dataset = build_training_dataset(
@@ -954,7 +1062,7 @@ if mode == "Live Monitoring":
     )
 
     col3.metric(
-        "Latest TFT Prediction",
+        "Latest Saved TFT Prediction",
         f"{latest_tft_prediction:,.2f} MW"
         if pd.notnull(latest_tft_prediction)
         else "N/A"
@@ -965,14 +1073,21 @@ if mode == "Live Monitoring":
         str(latest_row["timestamp_local"])
     )
 
+    latest_data_time = latest_row["timestamp_local"]
+
     if latest_prediction_time is not None:
-        st.caption(
-            f"Latest saved TFT prediction timestamp: {latest_prediction_time}"
-        )
+        st.caption(f"Latest data timestamp: {latest_data_time}")
+        st.caption(f"Latest saved TFT prediction timestamp: {latest_prediction_time}")
+
+        if latest_prediction_time < latest_data_time:
+            st.warning(
+                "Latest load/EIA data is newer than the saved TFT predictions. "
+                "Run TFT Prediction for Latest Data to synchronize the monitoring dashboard."
+            )
     else:
         st.info(
             "No TFT prediction has been saved yet. "
-            "Run Single Historical Prediction or Recent Test Backtest first."
+            "Run Single Historical Prediction, Recent Test Backtest, or Run TFT Prediction for Latest Data first."
         )
 
     st.markdown("### Evaluation Metrics from Saved TFT Predictions")
@@ -1011,6 +1126,37 @@ if mode == "Live Monitoring":
 
     chart_df = monitoring_df.sort_values("timestamp_utc").tail(selected_window).copy()
 
+    tft_points_in_window = int(chart_df["tft_prediction_mw"].notna().sum())
+    total_points_in_window = int(len(chart_df))
+    tft_coverage_pct = (
+        tft_points_in_window / total_points_in_window * 100
+        if total_points_in_window > 0
+        else 0
+    )
+
+    coverage_col1, coverage_col2 = st.columns(2)
+
+    coverage_col1.metric(
+        "TFT Prediction Coverage in Window",
+        f"{tft_points_in_window:,} / {total_points_in_window:,} rows"
+    )
+
+    coverage_col2.metric(
+        "TFT Coverage Percentage",
+        f"{tft_coverage_pct:.1f}%"
+    )
+
+    if tft_points_in_window == 0:
+        st.warning(
+            "No saved TFT predictions are available within the selected monitoring window. "
+            "Run TFT Prediction for Latest Data or select a longer monitoring window."
+        )
+    elif tft_coverage_pct < 50:
+        st.info(
+            "TFT predictions cover only part of the selected monitoring window. "
+            "The chart will avoid connecting prediction segments across large time gaps."
+        )
+
     fig, ax = plt.subplots(figsize=(12, 4))
 
     ax.plot(
@@ -1033,16 +1179,12 @@ if mode == "Live Monitoring":
     tft_chart_df = chart_df.dropna(subset=["tft_prediction_mw"]).copy()
 
     if not tft_chart_df.empty:
-        ax.plot(
-            tft_chart_df["timestamp_local"],
-            tft_chart_df["tft_prediction_mw"],
-            linestyle="-",
-            label="TFT Prediction"
-        )
-    else:
-        st.warning(
-            "No saved TFT predictions are available within the selected monitoring window. "
-            "Try selecting a longer monitoring window or run TFT prediction for the latest data."
+        plot_tft_prediction_segments(
+            ax=ax,
+            tft_chart_df=tft_chart_df,
+            time_col="timestamp_local",
+            prediction_col="tft_prediction_mw",
+            max_gap_hours=1.5,
         )
 
     ax.set_title("CAL Actual Load, EIA Forecast, and Saved TFT Predictions")
