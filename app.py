@@ -16,9 +16,23 @@ st.write(
 @st.cache_data
 def load_data():
     df = pd.read_csv("all_features_all_timerange.csv")
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
-    df["timestamp_local"] = pd.to_datetime(df["timestamp_local"])
-    df["local_date"] = pd.to_datetime(df["local_date"])
+
+    df["timestamp_utc"] = pd.to_datetime(
+        df["timestamp_utc"],
+        utc=True,
+        errors="coerce"
+    )
+
+    df["timestamp_local"] = (
+        pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
+        .dt.tz_convert("America/Los_Angeles")
+    )
+
+    df["local_date"] = pd.to_datetime(
+        df["local_date"],
+        errors="coerce"
+    )
+
     return df
 
 df = load_data()
